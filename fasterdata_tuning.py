@@ -60,23 +60,29 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
 def compute_default_sysctl_settings(max_speed_mbps: int, max_mtu: int):
     # Base defaults
     print ("Finding default sysctl settings for host with NIC speed: ", max_speed_mbps)
-    settings: Dict[str, str] = {
+    settings: Dict[str, str] = {   # defaults for 1G host
         "net.core.rmem_max": "67108864",
         "net.core.wmem_max": "67108864",
         "net.ipv4.tcp_rmem": "4096 87380 33554432",
         "net.ipv4.tcp_wmem": "4096 65536 33554432",
         "net.ipv4.tcp_no_metrics_save": "1",
         "net.core.default_qdisc": "fq",
-        "net.core.netdev_max_backlog" : "250000",
     }
 
     # Speed-based overrides
     if max_speed_mbps is not None:
-        if max_speed_mbps >= 40000:  # 40G and higher
+        if max_speed_mbps >= 100000:  # 100G and higher
+            settings["net.core.rmem_max"] = "2147483647"
+            settings["net.core.wmem_max"] = "2147483647"
+            settings["net.ipv4.tcp_rmem"] = "4096 87380 1073741824"
+            settings["net.ipv4.tcp_wmem"] = "4096 65536 1073741824"
+            settings["net.core.optmem_max"] = "1048576"  # this helps with zerocopy
+        elif max_speed_mbps >= 40000:  # 40G and higher
             settings["net.core.rmem_max"] = "536870912"
             settings["net.core.wmem_max"] = "536870912"
             settings["net.ipv4.tcp_rmem"] = "4096 87380 268435456"
             settings["net.ipv4.tcp_wmem"] = "4096 65536 268435456"
+            settings["net.core.optmem_max"] = "1048576"
         elif max_speed_mbps >= 10000:  # 10G and higher
             settings["net.core.rmem_max"] = "268435456"
             settings["net.core.wmem_max"] = "268435456"
@@ -308,13 +314,14 @@ def main():
         append_line_with_comment(tc_line, "set pacing", args.dry_run)
         summary.append("✓ Added pacing command to /etc/rc.local")
 
-        ip_line = f"/sbin/ip link set dev {iface} txqueuelen {TXQUEUELEN_DEFAULT}"
-        append_line_with_comment(ip_line, "set txqueuelen", args.dry_run)
-        summary.append("✓ Added txqueuelen command to /etc/rc.local")
+    print ("\nChecking for Ring Buffer settings...")
+    ip_line = f"/sbin/ip link set dev {iface} txqueuelen {TXQUEUELEN_DEFAULT}"
+    append_line_with_comment(ip_line, "set txqueuelen", args.dry_run)
+    summary.append("✓ Added txqueuelen command to /etc/rc.local")
 
-        ethtool_line = f"/usr/sbin/ethtool -G {iface} rx {RX_RING_DEFAULT} tx {TX_RING_DEFAULT}"
-        append_line_with_comment(ethtool_line, "set ring buffers", args.dry_run)
-        summary.append("✓ Added ring buffer command to /etc/rc.local")
+    ethtool_line = f"/usr/sbin/ethtool -G {iface} rx {RX_RING_DEFAULT} tx {TX_RING_DEFAULT}"
+    append_line_with_comment(ethtool_line, "set ring buffers", args.dry_run)
+    summary.append("✓ Added ring buffer command to /etc/rc.local")
 
     if args.dry_run:
         print("\n[dry-run] No changes were made.")
@@ -322,7 +329,10 @@ def main():
         print("\nSummary:")
         for s in summary:
             print("  " + s)
-        print("Done.")
+        print (f"\nCheck the contents of {SYSCTL_CONF} and {RC_LOCAL}, and then run: ")
+        print("   sysctl -p")
+        print("   sh /etc/rc.local")
+        print("\nDone.")
 
 if __name__ == "__main__":
     main()
