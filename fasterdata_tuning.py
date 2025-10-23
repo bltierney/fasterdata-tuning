@@ -35,15 +35,6 @@ TX_RING_DEFAULT = 8192
 SYSCTL_CONF = "/etc/sysctl.conf"
 RC_LOCAL = "/etc/rc.local"
 
-DEFAULT_SYSCTL = {
-    "net.core.rmem_max": "67108864",
-    "net.core.wmem_max": "67108864",
-    "net.ipv4.tcp_rmem": "4096 87380 33554432",
-    "net.ipv4.tcp_wmem": "4096 65536 33554432",
-    "net.ipv4.tcp_no_metrics_save": "1",
-    "net.ipv4.tcp_mtu_probing": "1",
-    "net.core.default_qdisc": "fq",
-}
 
 # ---------- Utility Functions ----------
 
@@ -65,6 +56,37 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
         return (e.returncode, e.output, str(e))
     except FileNotFoundError:
         return (127, "", f"Command not found: {cmd[0]}")
+
+def compute_default_sysctl_settings(max_speed_bps: int, max_mtu: int):
+    # Base defaults
+    settings: Dict[str, str] = {
+        "net.core.rmem_max": "67108864",
+        "net.core.wmem_max": "67108864",
+        "net.ipv4.tcp_rmem": "4096 87380 33554432",
+        "net.ipv4.tcp_wmem": "4096 65536 33554432",
+        "net.ipv4.tcp_no_metrics_save": "1",
+        "net.core.default_qdisc": "fq",
+        "net.core.netdev_max_backlog" : "250000",
+    }
+
+    # Speed-based overrides
+    if max_speed_bps is not None:
+        if max_speed_bps >= 40_000_000_000:  # 40G and higher
+            settings["net.core.rmem_max"] = "536870912"
+            settings["net.core.wmem_max"] = "536870912"
+            settings["net.ipv4.tcp_rmem"] = "4096 87380 268435456"
+            settings["net.ipv4.tcp_wmem"] = "4096 65536 268435456"
+        elif max_speed_bps >= 10_000_000_000:  # 10G and higher
+            settings["net.core.rmem_max"] = "268435456"
+            settings["net.core.wmem_max"] = "268435456"
+            settings["net.ipv4.tcp_rmem"] = "4096 87380 134217728"
+            settings["net.ipv4.tcp_wmem"] = "4096 65536 134217728"
+
+    # Jumbo frames consideration
+    if max_mtu and max_mtu > 8000:
+        settings["net.ipv4.tcp_mtu_probing"] = "1"
+
+    return settings
 
 def list_net_ifaces() -> List[str]:
     rc, out, _ = run_cmd(["ip", "-o", "link", "show"])
@@ -241,31 +263,34 @@ def main():
     require_linux()
     require_root(dry_run=args.dry_run)
 
-    update_sysctl_conf(DEFAULT_SYSCTL, dry_run=args.dry_run)
     summary = []
 
-    if args.pacing:
-        if args.interface:
-            iface = args.interface
-            if not iface_exists(iface):
-                print(f"Error: interface '{iface}' not found.", file=sys.stderr)
-                sys.exit(2)
-            speed_mbps = ethtool_speed_mbps(iface)
-            if not speed_mbps:
-                print(f"Error: unable to detect speed for '{iface}'.", file=sys.stderr)
-                sys.exit(2)
-        else:
-            fastest = pick_fastest_iface()
-            if not fastest:
-                print("Error: could not detect active NIC via ethtool.", file=sys.stderr)
-                sys.exit(2)
-            iface, speed_mbps = fastest
+    if args.interface:
+       iface = args.interface
+       if not iface_exists(iface):
+           print(f"Error: interface '{iface}' not found.", file=sys.stderr)
+           sys.exit(2)
+       speed_mbps = ethtool_speed_mbps(iface)
+       if not speed_mbps:
+           print(f"Error: unable to detect speed for '{iface}'.", file=sys.stderr)
+           sys.exit(2)
+    else:
+        fastest = pick_fastest_iface()
+        if not fastest:
+            print("Error: could not detect active NIC via ethtool.", file=sys.stderr)
+            sys.exit(2)
+        iface, speed_mbps = fastest
 
-        mtu = iface_mtu(iface)
-        mtu_str = str(mtu) if mtu is not None else "unknown"
+    mtu = iface_mtu(iface)
+    mtu_str = str(mtu) if mtu is not None else "unknown"
+
+    print(f"\nOptimizing Network Tuning for Interface: {iface} ({speed_mbps} Mb/s, MTU {mtu_str})")
+    settings = compute_default_sysctl_settings(speed_mbps, mtu)
+    update_sysctl_conf(settings, dry_run=args.dry_run)
+
+    if args.pacing:
         tc_line, pacing_mbit = build_tc_fq_maxrate_cmd(iface, speed_mbps)
 
-        print(f"Interface: {iface} ({speed_mbps} Mb/s, MTU {mtu_str})")
         if mtu is not None and mtu < 8000:
             print("Warning: MTU below 8000 – consider setting MTU to 9000.")
 
