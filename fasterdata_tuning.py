@@ -59,7 +59,6 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
 
 def compute_default_sysctl_settings(max_speed_mbps: int, max_mtu: int):
     # Base defaults
-    print ("Finding default sysctl settings for host with NIC speed: ", max_speed_mbps)
     settings: Dict[str, str] = {   # defaults for 1G host
         "net.core.rmem_max": "67108864",
         "net.core.wmem_max": "67108864",
@@ -243,29 +242,51 @@ def append_line_with_comment(cmd_line: str, comment: str, dry_run: bool):
     with open(RC_LOCAL, "w", encoding="utf-8") as f:
         f.write(new_content)
 
-def update_sysctl_conf(new_settings: Dict[str,str], dry_run: bool):
+def update_sysctl_conf(new_settings: Dict[str, str], dry_run: bool):
+    import datetime
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+
     old = ""
+    existing_keys = set()
+    added_keys = []
+    already_present = []
+
     if os.path.exists(SYSCTL_CONF):
         with open(SYSCTL_CONF, "r", encoding="utf-8", errors="replace") as f:
             old = f.read()
+            for line in old.splitlines():
+                if "=" in line:
+                    key = line.split("=")[0].strip()
+                    existing_keys.add(key)
+
     commented = comment_out_matching_keys(old, list(new_settings.keys()))
-    block_lines = ["", "# Added by fasterdata_tuning.py"]
+    block_lines = ["", f"# Added by fasterdata_tuning.py on {timestamp}"]
+
     for k, v in new_settings.items():
-        block_lines.append(f"{k} = {v}")
+        if k in existing_keys:
+            already_present.append(f"{k} = {v}")
+        else:
+            block_lines.append(f"{k} = {v}")
+            added_keys.append(f"{k} = {v}")
+
     block = "\n".join(block_lines) + "\n"
     new_content = commented + block if commented else block
 
-    if dry_run:
-        print(f"[dry-run] Would update {SYSCTL_CONF}:")
-        for k, v in new_settings.items():
-            print(f"  set {k} = {v}")
-    else:
-        file_backup(SYSCTL_CONF)
+    if not dry_run:
         with open(SYSCTL_CONF, "w", encoding="utf-8") as f:
             f.write(new_content)
-        rc, out, _ = run_cmd(["sysctl", "-p", SYSCTL_CONF])
-        if rc != 0:
-            print(f"Warning: sysctl -p returned {rc}.\n{out}", file=sys.stderr)
+
+    print("\nSysctl configuration summary:")
+    if added_keys:
+        print("  Added to sysctl.conf:")
+        for line in added_keys:
+            print(f"    {line}")
+    if already_present:
+        print("  Already present in sysctl.conf:")
+        for line in already_present:
+            print(f"    {line}")
+    if not added_keys and not already_present:
+        print("  No sysctl changes detected.")
 
 def main():
     parser = argparse.ArgumentParser(description="Tune sysctl and optionally add pacing and NIC tuning.")
