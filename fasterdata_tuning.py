@@ -1,142 +1,358 @@
 #!/usr/bin/env python3
 """
-fasterdata_tuning.py — System tuning script for high-speed data transfers.
+fasterdata_tuning.py — system tuning helper with safe sysctl updates, pacing, and NIC tuning.
 
 Features:
-  • Detects fastest interface and configures sysctl networking parameters
-  • Optionally sets fq pacing at 20% of NIC speed
-  • Skips duplicate sysctl.conf entries
-  • Summarizes all applied settings
+- Comments out matching keys in /etc/sysctl.conf before appending new values.
+- Adds --pacing flag: sets tc fq maxrate to 20% of fastest or specified NIC.
+- Adds --interface option: specify NIC manually.
+- Appends tc/ip/ethtool commands to /etc/rc.local (creating it if needed).
+- Each appended independently, with timestamped comment lines.
+- Duplicate checks with warnings for existing similar lines.
+- Prints NIC speed and MTU; warns if MTU < 8000 (suggest 9000).
+- Uses "gbit" or "mbit" for tc maxrate; pacing rate ceiled to 100 Mbit increments.
+- Includes summary of all actions.
 """
 
 import argparse
+import math
 import os
+import platform
 import re
+import shutil
+import stat
 import subprocess
 import sys
-from datetime import datetime
+from datetime import date
+from typing import Dict, List, Optional, Tuple
+
+# ---------- Constants ----------
+
+TXQUEUELEN_DEFAULT = 10000
+RX_RING_DEFAULT = 8192
+TX_RING_DEFAULT = 8192
 
 SYSCTL_CONF = "/etc/sysctl.conf"
 RC_LOCAL = "/etc/rc.local"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ---------- Utility Functions ----------
 
-def run_cmd(cmd):
-    """Run a shell command and return stripped stdout, or None on error."""
+def require_linux():
+    if platform.system() != "Linux":
+        print("Error: This script only supports Linux.", file=sys.stderr)
+        sys.exit(1)
+
+def require_root(dry_run: bool):
+    if not dry_run and os.geteuid() != 0:
+        print("Error: Must be run as root unless using --dry-run.", file=sys.stderr)
+        sys.exit(1)
+
+def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     try:
-        return subprocess.check_output(cmd, shell=True, text=True).strip()
-    except subprocess.CalledProcessError:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return (0, out, "")
+    except subprocess.CalledProcessError as e:
+        return (e.returncode, e.output, str(e))
+    except FileNotFoundError:
+        return (127, "", f"Command not found: {cmd[0]}")
+
+def compute_default_sysctl_settings(max_speed_mbps: int, max_mtu: int):
+    # Base defaults
+    print ("Finding default sysctl settings for host with NIC speed: ", max_speed_mbps)
+    settings: Dict[str, str] = {   # defaults for 1G host
+        "net.core.rmem_max": "67108864",
+        "net.core.wmem_max": "67108864",
+        "net.ipv4.tcp_rmem": "4096 87380 33554432",
+        "net.ipv4.tcp_wmem": "4096 65536 33554432",
+        "net.ipv4.tcp_no_metrics_save": "1",
+        "net.core.default_qdisc": "fq",
+    }
+
+    # Speed-based overrides
+    if max_speed_mbps is not None:
+        if max_speed_mbps >= 100000:  # 100G and higher
+            settings["net.core.rmem_max"] = "2147483647"
+            settings["net.core.wmem_max"] = "2147483647"
+            settings["net.ipv4.tcp_rmem"] = "4096 87380 1073741824"
+            settings["net.ipv4.tcp_wmem"] = "4096 65536 1073741824"
+            settings["net.core.optmem_max"] = "1048576"  # this helps with zerocopy
+        elif max_speed_mbps >= 40000:  # 40G and higher
+            settings["net.core.rmem_max"] = "536870912"
+            settings["net.core.wmem_max"] = "536870912"
+            settings["net.ipv4.tcp_rmem"] = "4096 87380 268435456"
+            settings["net.ipv4.tcp_wmem"] = "4096 65536 268435456"
+            settings["net.core.optmem_max"] = "1048576"
+        elif max_speed_mbps >= 10000:  # 10G and higher
+            settings["net.core.rmem_max"] = "268435456"
+            settings["net.core.wmem_max"] = "268435456"
+            settings["net.ipv4.tcp_rmem"] = "4096 87380 134217728"
+            settings["net.ipv4.tcp_wmem"] = "4096 65536 134217728"
+
+    # Jumbo frames consideration
+    if max_mtu and max_mtu > 8000:
+        settings["net.ipv4.tcp_mtu_probing"] = "1"
+
+    return settings
+
+def list_net_ifaces() -> List[str]:
+    rc, out, _ = run_cmd(["ip", "-o", "link", "show"])
+    if rc != 0:
+        return []
+    ifaces = []
+    for line in out.splitlines():
+        m = re.match(r"\d+:\s+([^:]+):", line)
+        if m:
+            iface = m.group(1)
+            if iface.startswith(("lo", "veth", "docker", "br-", "wg")):
+                continue
+            ifaces.append(iface)
+    return ifaces
+
+def iface_exists(iface: str) -> bool:
+    rc, _, _ = run_cmd(["ip", "link", "show", iface])
+    return rc == 0
+
+def ethtool_speed_mbps(iface: str) -> Optional[int]:
+    rc, out, _ = run_cmd(["ethtool", iface])
+    if rc != 0:
         return None
+    link_ok = False
+    speed_mbps = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Link detected:"):
+            link_ok = line.split(":",1)[1].strip().lower() == "yes"
+        elif line.startswith("Speed:"):
+            val = line.split(":",1)[1].strip()
+            m = re.match(r"(\d+)\s*Mb/s", val, re.IGNORECASE)
+            if m:
+                speed_mbps = int(m.group(1))
+    if link_ok and speed_mbps:
+        return speed_mbps
+    return None
 
-
-def get_interfaces():
-    """Return dict of interface → {'speed': int (Gbps), 'mtu': int}."""
-    interfaces = {}
-    ip_output = run_cmd("ls /sys/class/net") or ""
-    for iface in ip_output.split():
-        if iface == "lo":
-            continue
-        speed = run_cmd(f"ethtool {iface} | grep Speed | awk '{{print $2}}'")
-        mtu = run_cmd(f"ip link show {iface} | awk '/mtu/ {{print $5}}'")
+def iface_mtu(iface: str) -> Optional[int]:
+    rc, out, _ = run_cmd(["ip", "-o", "link", "show", iface])
+    if rc != 0:
+        return None
+    m = re.search(r"\bmtu\s+(\d+)\b", out)
+    if m:
         try:
-            speed_gbps = int(re.sub(r'[^0-9]', '', speed or '0')) // 1000
+            return int(m.group(1))
         except ValueError:
-            speed_gbps = 0
-        interfaces[iface] = {"speed": speed_gbps, "mtu": int(mtu or 0)}
-    return interfaces
+            return None
+    return None
 
+def pick_fastest_iface() -> Optional[Tuple[str,int]]:
+    candidates = []
+    for iface in list_net_ifaces():
+        sp = ethtool_speed_mbps(iface)
+        if sp:
+            candidates.append((iface, sp))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0]
 
-def comment_existing_sysctl(key):
-    """Comment out existing sysctl.conf lines that match a key."""
-    if not os.path.exists(SYSCTL_CONF):
+def ceil_100mbit(mbit: float) -> int:
+    return int(math.ceil(mbit / 100.0) * 100)
+
+def format_rate_mbit(mbit: int) -> str:
+    if mbit >= 1000:
+        g = mbit / 1000.0
+        s = f"{g:.1f}"
+        if s.endswith(".0"):
+            s = s[:-2]
+        return f"{s}gbit"
+    else:
+        return f"{mbit}mbit"
+
+def build_tc_fq_maxrate_cmd(iface: str, speed_mbps: int) -> Tuple[str, int]:
+    pacing_mbit = ceil_100mbit(speed_mbps * 0.20)
+    rate_str = format_rate_mbit(int(pacing_mbit))
+    return (f"tc qdisc add dev {iface} root fq maxrate {rate_str}", int(pacing_mbit))
+
+def file_backup(path: str):
+    if not os.path.exists(path):
         return
-    with open(SYSCTL_CONF, "r") as f:
-        lines = f.readlines()
-    changed = False
-    with open(SYSCTL_CONF, "w") as f:
-        for line in lines:
-            if re.match(fr"^\s*{re.escape(key)}\s*=", line):
-                f.write(f"# {line.strip()}  # commented by fasterdata_tuning\n")
-                changed = True
-            else:
-                f.write(line)
-    if changed:
-        print(f"Commented existing sysctl entry for {key}")
+    bak = f"{path}.bak"
+    try:
+        shutil.copy2(path, bak)
+    except Exception as e:
+        print(f"Warning: could not create backup {bak}: {e}", file=sys.stderr)
 
-
-def add_sysctl_setting(key, value, summary):
-    """Add key=value to sysctl.conf if not already present."""
-    existing = ""
-    if os.path.exists(SYSCTL_CONF):
-        with open(SYSCTL_CONF) as f:
-            existing = f.read()
-    line = f"{key} = {value}"
-    if re.search(fr"^\s*{re.escape(key)}\s*=", existing, re.M):
-        print(f"Skipping duplicate sysctl: {key}")
-        return
-    with open(SYSCTL_CONF, "a") as f:
-        f.write(f"{line}\n")
-    summary.append(f"Added sysctl: {line}")
-    print(f"Added: {line}")
-
-
-def append_rc_local(cmd_line):
-    """Append a command to /etc/rc.local if not already present."""
-    if not os.path.exists(RC_LOCAL):
-        print(f"WARNING: {RC_LOCAL} does not exist; creating it.")
-        with open(RC_LOCAL, "w") as f:
-            f.write("#!/bin/sh -e\n\nexit 0\n")
-        os.chmod(RC_LOCAL, 0o755)
-
-    with open(RC_LOCAL, "r") as f:
-        lines = f.readlines()
-
-    if any(cmd_line in line for line in lines):
-        print(f"Command already exists in {RC_LOCAL}")
-        return
-
-    insert_pos = len(lines)
+def comment_out_matching_keys(content: str, keys: List[str]) -> str:
+    lines = content.splitlines()
+    key_patterns = [re.compile(rf"^\s*{re.escape(k)}\s*=", re.IGNORECASE) for k in keys]
     for i, line in enumerate(lines):
-        if line.strip() == "exit 0":
-            insert_pos = i
-            break
+        for kp in key_patterns:
+            if kp.search(line) and not line.lstrip().startswith("#"):
+                lines[i] = "# " + line
+                break
+    return "\n".join(lines) + ("\n" if content.endswith("\n") else "")
 
-    lines.insert(insert_pos, f"{cmd_line}\n")
-    with open(RC_LOCAL, "w") as f:
-        f.writelines(lines)
-    print(f"Appended to {RC_LOCAL}: {cmd_line}")
+def ensure_rc_local_exists(dry_run: bool):
+    if os.path.exists(RC_LOCAL):
+        return
+    text = "#!/bin/sh -e\n\n# Created by fasterdata_tuning.py\n\nexit 0\n"
+    if dry_run:
+        print(f"[dry-run] Would create {RC_LOCAL}.")
+        return
+    with open(RC_LOCAL, "w", encoding="utf-8") as f:
+        f.write(text)
+    st = os.stat(RC_LOCAL)
+    os.chmod(RC_LOCAL, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+def append_line_with_comment(cmd_line: str, comment: str, dry_run: bool):
+    ensure_rc_local_exists(dry_run)
+    existing_text = ""
+    if os.path.exists(RC_LOCAL):
+        with open(RC_LOCAL, "r", encoding="utf-8", errors="replace") as f:
+            existing_text = f.read()
 
-# ---------------------------------------------------------------------------
-# Main logic
-# ---------------------------------------------------------------------------
+    # Look for any similar existing command
+    pattern = re.compile(rf"^\s*{re.escape(cmd_line.split()[0])}.*{re.escape(cmd_line.split()[2])}.*$", re.MULTILINE)
+    m = pattern.search(existing_text)
+    if m:
+        existing_line = m.group(0).strip()
+        if existing_line == cmd_line.strip():
+            # Identical line already exists — silently skip
+            return
+        else:
+            # Only warn if the lines differ
+            print(f"\nWARNING: Similar line already exists in {RC_LOCAL}:")
+            print(f"  existing: {existing_line}")
+            print(f"  proposed: {cmd_line}")
+            return
+
+    comment_line = f"# Added by fasterdata_tuning.py – {date.today().isoformat()} – {comment}"
+    insertion = f"{comment_line}\n{cmd_line}\n"
+
+    if dry_run:
+        print(f"[dry-run] Would append to {RC_LOCAL}:\n  {comment_line}\n  {cmd_line}")
+        return
+
+    new_content = existing_text
+    if re.search(r"^\s*exit\s+0\s*$", existing_text, re.MULTILINE):
+        new_content = re.sub(r"^\s*exit\s+0\s*$", insertion + "\nexit 0", existing_text, flags=re.MULTILINE)
+    else:
+        new_content = existing_text.rstrip("\n") + "\n" + insertion
+
+    file_backup(RC_LOCAL)
+    with open(RC_LOCAL, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+def update_sysctl_conf(new_settings: Dict[str,str], dry_run: bool):
+    old = ""
+    if os.path.exists(SYSCTL_CONF):
+        with open(SYSCTL_CONF, "r", encoding="utf-8", errors="replace") as f:
+            old = f.read()
+    commented = comment_out_matching_keys(old, list(new_settings.keys()))
+    block_lines = ["", "# Added by fasterdata_tuning.py"]
+    for k, v in new_settings.items():
+        block_lines.append(f"{k} = {v}")
+    block = "\n".join(block_lines) + "\n"
+    new_content = commented + block if commented else block
+
+    if dry_run:
+        print(f"[dry-run] Would update {SYSCTL_CONF}:")
+        for k, v in new_settings.items():
+            print(f"  set {k} = {v}")
+    else:
+        file_backup(SYSCTL_CONF)
+        with open(SYSCTL_CONF, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        rc, out, _ = run_cmd(["sysctl", "-p", SYSCTL_CONF])
+        if rc != 0:
+            print(f"Warning: sysctl -p returned {rc}.\n{out}", file=sys.stderr)
 
 def main():
-    parser = argparse.ArgumentParser(description="Tune system for faster data transfer.")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes.")
-    parser.add_argument("--interface", help="Specify interface; defaults to fastest.")
-    parser.add_argument("--pacing", action="store_true", help="Enable fq pacing at 20% of NIC speed.")
+    parser = argparse.ArgumentParser(description="Tune sysctl and optionally add pacing and NIC tuning.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change; no writes.")
+    parser.add_argument("--pacing", action="store_true", help="Enable pacing and NIC tuning.")
+    parser.add_argument("--interface", type=str, help="Specify NIC to tune (default: fastest active interface).")
     args = parser.parse_args()
 
-    if os.geteuid() != 0:
-        sys.exit("ERROR: Must run as root.")
+    require_linux()
+    require_root(dry_run=args.dry_run)
 
-    # Detect interfaces
-    interfaces = get_interfaces()
-    if not interfaces:
-        sys.exit("No interfaces found.")
+    summary = []
 
-    iface = args.interface
-    if not iface:
-        iface = max(interfaces, key=lambda i: interfaces[i]["speed"])
-    info = interfaces[iface]
-    speed = info["speed"]
-    mtu = info["mtu"]
+    if args.interface:
+       iface = args.interface
+       if not iface_exists(iface):
+           print(f"Error: interface '{iface}' not found.", file=sys.stderr)
+           sys.exit(2)
+       speed_mbps = ethtool_speed_mbps(iface)
+       if not speed_mbps:
+           print(f"Error: unable to detect speed for '{iface}'.", file=sys.stderr)
+           sys.exit(2)
+    else:
+        fastest = pick_fastest_iface()
+        if not fastest:
+            print("Error: could not detect active NIC via ethtool.", file=sys.stderr)
+            sys.exit(2)
+        iface, speed_mbps = fastest
 
-    print(f"Detected interface: {iface} ({speed} Gbps, MTU {mtu})")
+    mtu = iface_mtu(iface)
+    mtu_str = str(mtu) if mtu is not None else "unknown"
+    speed_str = f"{speed_mbps/1000:.1f} Gb/s" if speed_mbps >= 1000 else f"{speed_mbps} Mb/s"
+    print(f"\nOptimizing Network Tuning for Interface: {iface} ({speed_str}, MTU {mtu_str})\n")
+
+    settings = compute_default_sysctl_settings(speed_mbps, mtu)
+    update_sysctl_conf(settings, dry_run=args.dry_run)
+
+    print("\nChecking for txqueuelen settings...")
+    ip_line = f"/sbin/ip link set dev {iface} txqueuelen {TXQUEUELEN_DEFAULT}"
+
+    # Read /etc/rc.local to see if ring buffer line already exists
+    found_ring = False
+    if os.path.exists('/etc/rc.local'):
+        with open('/etc/rc.local', 'r') as f:
+            for line in f:
+                if ip_line in line:
+                    found_ring = True
+                    break
+    if found_ring:
+        print('found txqueuelen setting in rc.local')
+    else:
+        append_line_with_comment(ip_line, 'set txqueuelen', args.dry_run)
+        summary.append('✓ Added txqueuelen command to /etc/rc.local')
+
+    print("\nChecking for Ring Buffer settings...")
+    ethtool_line = f"/usr/sbin/ethtool -G {iface} rx {RX_RING_DEFAULT} tx {TX_RING_DEFAULT}"
+
+    # Read /etc/rc.local to see if ring buffer line already exists
+    found_ring = False
+    if os.path.exists('/etc/rc.local'):
+        with open('/etc/rc.local', 'r') as f:
+            for line in f:
+                if ethtool_line in line:
+                    found_ring = True
+                    break
+    if found_ring:
+        print('found Ring Buffer setting in rc.local')
+    else:
+        append_line_with_comment(ethtool_line, 'set ring buffers', args.dry_run)
+        summary.append('✓ Added ring buffer command to /etc/rc.local')
+
+    if args.pacing:
+        tc_line, pacing_mbit = build_tc_fq_maxrate_cmd(iface, speed_mbps)
+        print(f"\n Adding Pacing command: {tc_line}  # ({pacing_mbit} mbit)")
+        append_line_with_comment(tc_line, "set pacing", args.dry_run)
+        summary.append("✓ Added pacing command to /etc/rc.local")
+
+    if args.dry_run:
+        print("\n[dry-run] No changes were made.")
+    else:
+        print("\nSummary:")
+        for s in summary:
+            print("  " + s)
+        print (f"\nCheck the contents of {SYSCTL_CONF} and {RC_LOCAL}, and then run: ")
+        print("   sysctl -p")
+        print("   sh /etc/rc.local")
+        print("\nDone.")
 
     if not args.pacing:
         print("⚠️  Consider adding '--pacing' to enable fq pacing at 20% of NIC speed.")
@@ -144,52 +360,5 @@ def main():
     if mtu < 8000:
         print("⚠️  MTU below 9000 detected — consider enabling jumbo frames.")
 
-    summary = [f"Tuning summary ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"]
-
-    sysctl_settings = {
-        "net.core.rmem_max": 67108864,
-        "net.core.wmem_max": 67108864,
-        "net.ipv4.tcp_rmem": "4096 87380 33554432",
-        "net.ipv4.tcp_wmem": "4096 65536 33554432",
-        "net.ipv4.tcp_no_metrics_save": 1,
-        "net.ipv4.tcp_mtu_probing": 1,
-        "net.core.default_qdisc": "fq",
-    }
-
-    for key, value in sysctl_settings.items():
-        comment_existing_sysctl(key)
-        add_sysctl_setting(key, value, summary)
-
-    if args.pacing:
-        rate_gbps = speed * 0.2
-        pacing_cmd = (
-            f"/sbin/tc qdisc replace dev {iface} root fq maxrate {rate_gbps:.1f}Gbit"
-        )
-        if args.dry_run:
-            print(f"[DRY RUN] Would apply: {pacing_cmd}")
-        else:
-            append_rc_local(pacing_cmd)
-        summary.append(f"Pacing set to {rate_gbps:.1f} Gbps on {iface}")
-
-    # Increase ring buffer and txqueuelen
-    ring_cmds = [
-        f"/usr/sbin/ethtool -G {iface} rx 8192 tx 8192",
-        f"/sbin/ip link set dev {iface} txqueuelen 10000",
-    ]
-    for cmd in ring_cmds:
-        if args.dry_run:
-            print(f"[DRY RUN] Would append: {cmd}")
-        else:
-            append_rc_local(cmd)
-        summary.append(f"Queued {cmd}")
-
-    print("\n--- Summary ---")
-    print("\n".join(summary))
-
-
 if __name__ == "__main__":
-    if sys.platform.startswith("linux"):
-        main()
-    else:
-        sys.exit("This script must be run on a Linux system.")
-
+    main()
