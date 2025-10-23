@@ -57,8 +57,9 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     except FileNotFoundError:
         return (127, "", f"Command not found: {cmd[0]}")
 
-def compute_default_sysctl_settings(max_speed_bps: int, max_mtu: int):
+def compute_default_sysctl_settings(max_speed_mbps: int, max_mtu: int):
     # Base defaults
+    print ("Finding default sysctl settings for host with NIC speed: ", max_speed_mbps)
     settings: Dict[str, str] = {
         "net.core.rmem_max": "67108864",
         "net.core.wmem_max": "67108864",
@@ -70,13 +71,13 @@ def compute_default_sysctl_settings(max_speed_bps: int, max_mtu: int):
     }
 
     # Speed-based overrides
-    if max_speed_bps is not None:
-        if max_speed_bps >= 40_000_000_000:  # 40G and higher
+    if max_speed_mbps is not None:
+        if max_speed_mbps >= 40000:  # 40G and higher
             settings["net.core.rmem_max"] = "536870912"
             settings["net.core.wmem_max"] = "536870912"
             settings["net.ipv4.tcp_rmem"] = "4096 87380 268435456"
             settings["net.ipv4.tcp_wmem"] = "4096 65536 268435456"
-        elif max_speed_bps >= 10_000_000_000:  # 10G and higher
+        elif max_speed_mbps >= 10000:  # 10G and higher
             settings["net.core.rmem_max"] = "268435456"
             settings["net.core.wmem_max"] = "268435456"
             settings["net.ipv4.tcp_rmem"] = "4096 87380 134217728"
@@ -204,13 +205,20 @@ def append_line_with_comment(cmd_line: str, comment: str, dry_run: bool):
         with open(RC_LOCAL, "r", encoding="utf-8", errors="replace") as f:
             existing_text = f.read()
 
+    # Look for any similar existing command
     pattern = re.compile(rf"^\s*{re.escape(cmd_line.split()[0])}.*{re.escape(cmd_line.split()[2])}.*$", re.MULTILINE)
     m = pattern.search(existing_text)
     if m:
-        print(f"WARNING: Similar line already exists in {RC_LOCAL}:")
-        print(f"  existing: {m.group(0)}")
-        print(f"  proposed: {cmd_line}")
-        return
+        existing_line = m.group(0).strip()
+        if existing_line == cmd_line.strip():
+            # Identical line already exists — silently skip
+            return
+        else:
+            # Only warn if the lines differ
+            print(f"\nWARNING: Similar line already exists in {RC_LOCAL}:")
+            print(f"  existing: {existing_line}")
+            print(f"  proposed: {cmd_line}")
+            return
 
     comment_line = f"# Added by fasterdata_tuning.py – {date.today().isoformat()} – {comment}"
     insertion = f"{comment_line}\n{cmd_line}\n"
@@ -283,8 +291,9 @@ def main():
 
     mtu = iface_mtu(iface)
     mtu_str = str(mtu) if mtu is not None else "unknown"
+    speed_str = f"{speed_mbps/1000:.1f} Gb/s" if speed_mbps >= 1000 else f"{speed_mbps} Mb/s"
+    print(f"\nOptimizing Network Tuning for Interface: {iface} ({speed_str}, MTU {mtu_str})\n")
 
-    print(f"\nOptimizing Network Tuning for Interface: {iface} ({speed_mbps} Mb/s, MTU {mtu_str})")
     settings = compute_default_sysctl_settings(speed_mbps, mtu)
     update_sysctl_conf(settings, dry_run=args.dry_run)
 
@@ -294,7 +303,7 @@ def main():
         if mtu is not None and mtu < 8000:
             print("Warning: MTU below 8000 – consider setting MTU to 9000.")
 
-        print(f"Pacing command: {tc_line}  # ({pacing_mbit} mbit)")
+        print(f"\n Adding Pacing command: {tc_line}  # ({pacing_mbit} mbit)")
 
         append_line_with_comment(tc_line, "set pacing", args.dry_run)
         summary.append("✓ Added pacing command to /etc/rc.local")
