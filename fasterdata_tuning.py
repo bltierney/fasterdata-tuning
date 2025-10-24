@@ -358,11 +358,24 @@ def main():
         append_line_with_comment(ethtool_line, 'set ring buffers', args.dry_run)
         summary.append('✓ Added ring buffer command to /etc/rc.local')
 
+
+    # Check for pacing command in /etc/rc.local
+    found_tc = False
+    if os.path.exists(RC_LOCAL):
+        with open(RC_LOCAL, "r") as f:
+            for line in f:
+                if f"tc qdisc add dev {iface}" in line:
+                    found_tc = True
+                    break
+
     if args.pacing:
         tc_line, pacing_mbit = build_tc_fq_maxrate_cmd(iface, speed_mbps)
         print(f"\n Adding Pacing command: {tc_line}  # ({pacing_mbit} mbit)")
         append_line_with_comment(tc_line, "set pacing", args.dry_run)
         summary.append("✓ Added pacing command to /etc/rc.local")
+    # Suggest pacing only if none exists and not requested
+    elif not found_tc:
+        print("⚠️  Consider adding '--pacing' to enable fq pacing at 20% of NIC speed.")
 
     if args.dry_run:
         print("\n[dry-run] No changes were made.")
@@ -374,9 +387,6 @@ def main():
         print("   sysctl -p")
         print("   sh /etc/rc.local")
         print("\nDone.")
-
-    if not args.pacing:
-        print("⚠️  Consider adding '--pacing' to enable fq pacing at 20% of NIC speed.")
 
     if mtu < 8000:
         print("⚠️  MTU below 9000 detected — consider enabling jumbo frames.")
